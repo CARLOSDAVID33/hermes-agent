@@ -17,14 +17,17 @@ if __name__ == "__main__":
         pass  # a partial ``hermes update`` can leave the bootstrap unregistered
 
 import base64
+import binascii
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import sys
+from pathlib import Path
 from typing import Any, Optional
 
-from agent.tool_dispatch_helpers import _is_multimodal_tool_result
+from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,34 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
     return inspect.Signature(params, return_annotation=Any), annots
 
 
+# Image types an MCP image block carries here (the SDK's own suffix table); anything else stays text.
+_MCP_IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
+
+
+def _decode_image_data_url(url: str) -> tuple[bytes, str] | None:
+    """``(bytes, format)`` of a well-formed base64 image data URL, else None."""
+    header, sep, payload = url.partition(",")
+    if not (sep and payload and header.startswith("data:") and header.endswith(";base64")):
+        return None
+    fmt = _MCP_IMAGE_FORMATS.get(header[len("data:"):].split(";")[0].lower())
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except binascii.Error:
+        return None
+    return (data, fmt) if fmt and data else None
+
+
+def _read_image_file(path: str) -> tuple[bytes, str] | None:
+    """``(bytes, format)`` of a readable image file, else None. Read here: the SDK's ``Image(path=)``
+    reads lazily during serialization, where a vanished file fails the whole call."""
+    fmt = _MCP_IMAGE_FORMATS.get(mimetypes.guess_type(path)[0] or "")
+    try:
+        data = Path(path).read_bytes() if fmt else b""
+    except OSError:
+        return None
+    return (data, fmt) if data else None
+
+
 def _project_tool_result(tool_name: str, result: Any) -> Any:
     """Project a Hermes tool result onto something MCP can actually deliver.
 
@@ -67,50 +98,47 @@ def _project_tool_result(tool_name: str, result: Any) -> Any:
     ``computer_use``) died in pydantic validation — "Input should be a valid string" — instead of
     returning the image, and every MCP client lost the vision half of the tool surface.
 
-    Text stays text; a multimodal envelope becomes a text block plus a real MCP image block read
-    from the screenshot path the envelope carries or, failing that, decoded from the base64 data
-    URL in its ``content`` (``vision_analyze`` carries no path). Anything else is JSON-serialized
-    so an unexpected shape degrades into text rather than a protocol error.
+    Text stays text; a multimodal envelope becomes its text blocks plus real MCP image blocks, as
+    Hermes' own loop would send it to a vision model. Anything else is JSON-serialized so an
+    unexpected shape degrades into text rather than a protocol error.
     """
     if isinstance(result, str):
         return result
-    if _is_multimodal_tool_result(result):
-        meta = result.get("meta") or {}
-        text = result.get("text_summary") or meta.get("text_summary") or ""
-        if not text:
-            text = json.dumps({k: v for k, v in result.items() if k != "content"},
-                              ensure_ascii=False, default=str)
-        path = meta.get("screenshot_path") or meta.get("image_path") or ""
-        # Only ``content`` holds the full image URL; ``meta.image_url`` is cut to 200 chars.
-        images = [p.get("image_url") for p in result["content"]
-                  if isinstance(p, dict) and p.get("type") == "image_url"]
-        url = next((i["url"] for i in images if isinstance(i, dict) and isinstance(i.get("url"), str)), "")
-        header, _, payload = url.partition(",")
-        if path:
-            text = f"{text}\n\n[screenshot: {path}]"
-        elif not (header.startswith("data:") and header.endswith(";base64")):
-            # A remote URL is named, not fetched: the bridge makes no network calls of its own.
-            logger.warning("%s returned a multimodal result with no inline image; sending text only",
-                           tool_name)
-            return f"{text}\n\n[image: {url}]" if url else text
+    if not _is_multimodal_tool_result(result):
+        return json.dumps(result, ensure_ascii=False, default=str)
+    parts = [p for p in result["content"] if isinstance(p, dict)]
+    urls = [p["image_url"].get("url") for p in parts
+            if p.get("type") == "image_url" and isinstance(p.get("image_url"), dict)]
+    urls = [u for u in urls if isinstance(u, str)]
+    # The inline images are the producer's prepared copies (resized to the embed budget); the
+    # meta path is the full-size original kept for sharing, so it is only the fallback.
+    images = [image for image in map(_decode_image_data_url, urls) if image]
+    meta = result.get("meta") or {}
+    path = meta.get("screenshot_path") or meta.get("image_path") or ""
+    if not images and path and (image := _read_image_file(path)):
+        images.append(image)
+    # A remote URL is named, not fetched: the bridge makes no network calls of its own.
+    notes = [f"[image: {u}]" for u in urls if not u.startswith("data:")]
+    if path:
+        notes.append(f"[screenshot: {path}]")
+    # The summary is what Hermes sends a model that cannot see the image.
+    text_only = "\n\n".join([_multimodal_text_summary(result), *notes])
+    if not images:
+        logger.warning("%s returned a multimodal result with no deliverable image; sending text only",
+                       tool_name)
+        return text_only
+    try:
+        from mcp.server.mcpserver.utilities.types import Image  # mcp >= 2.0
+    except ImportError:
         try:
-            from mcp.server.mcpserver.utilities.types import Image  # mcp >= 2.0
+            from mcp.server.fastmcp.utilities.types import Image  # mcp 1.x
         except ImportError:
-            try:
-                from mcp.server.fastmcp.utilities.types import Image  # mcp 1.x
-            except ImportError:
-                logger.warning("%s: SDK has no Image helper; sending text only", tool_name)
-                return text
-        try:
-            if path:
-                return [text, Image(path=path)]
-            # data:image/jpeg;base64,... -> format "jpeg" -> image/jpeg (no subtype -> the SDK's png)
-            fmt = header[len("data:"):].split(";")[0].rpartition("/")[2]
-            return [text, Image(data=base64.b64decode(payload), format=fmt or None)]
-        except Exception:
-            logger.exception("%s: attaching image %s failed", tool_name, path or header)
-            return text
-    return json.dumps(result, ensure_ascii=False, default=str)
+            logger.warning("%s: SDK has no Image helper; sending text only", tool_name)
+            return text_only
+    # The text blocks carry what the summary drops: the question and any crop/scale coordinate mapping.
+    text = "\n\n".join(str(p["text"]) for p in parts if p.get("type") == "text" and p.get("text"))
+    return ["\n\n".join([text or _multimodal_text_summary(result), *notes]),
+            *(Image(data=data, format=fmt) for data, fmt in images)]
 
 
 # Each name MUST match a registered Hermes tool ``model_tools.handle_function_call()`` can dispatch.

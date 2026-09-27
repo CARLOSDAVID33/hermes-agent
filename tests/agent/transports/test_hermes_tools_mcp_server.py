@@ -13,6 +13,8 @@ import inspect
 import json
 import sys
 
+import pytest
+
 from agent.transports.hermes_tools_mcp_server import (
     _project_tool_result,
     _signature_from_schema,
@@ -148,20 +150,54 @@ def test_multimodal_result_becomes_text_plus_image(tmp_path):
     assert _project_tool_result("t", {"a": 1}) == '{"a": 1}'
 
 
-def test_vision_analyze_data_url_becomes_image_block():
-    """vision_analyze carries no path: its image is only the data URL in ``content`` (``meta.image_url``
-    is truncated), so the image block must hold exactly the bytes and type of that data URL."""
-    from tools.vision_tools import _build_native_vision_tool_result
+def _call_through_sdk(monkeypatch, tool_name, tool_result):
+    """Content blocks the installed SDK serializes when the real registered handler returns ``tool_result``."""
+    import asyncio
+
+    import model_tools
+    from agent.transports.hermes_tools_mcp_server import _build_server
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_: [{"type": "function", "function": {
+        "name": tool_name, "description": tool_name, "parameters": {"type": "object", "properties": {}}}}])
+    monkeypatch.setattr(model_tools, "handle_function_call", lambda *_args, **_kwargs: tool_result)
+    result = asyncio.run(_build_server().call_tool(tool_name, {}))
+    assert not result.is_error
+    return result.content
+
+
+def test_vision_analyze_keeps_question_and_coordinate_mapping(monkeypatch):
+    """vision_analyze carries its image only as a data URL in ``content`` and its question plus the
+    crop/scale coordinate mapping only in the text part, so the client needs both, not the summary."""
+    from tools.vision_tools import _build_native_vision_tool_result, _build_scale_note
 
     raw = b"\xff\xd8\xff\xe0" + bytes(range(256)) * 4
+    note = _build_scale_note({"orig_width": 2000, "orig_height": 2000, "new_width": 500, "new_height": 500},
+                             {"x": 100, "y": 200})
     envelope = _build_native_vision_tool_result(
-        image_url="https://example.com/cat.jpg", question="what is it?",
-        image_data_url="data:image/jpeg;base64," + base64.b64encode(raw).decode(), image_size_bytes=len(raw))
-    text, image = _project_tool_result("vision_analyze", envelope)
-    assert text == envelope["text_summary"]
-    block = image.to_image_content()
-    assert base64.b64decode(block.data) == raw
-    assert block.mime_type == "image/jpeg"
+        image_url="https://example.com/cat.jpg", question="where is the cat?",
+        image_data_url="data:image/jpeg;base64," + base64.b64encode(raw).decode(),
+        image_size_bytes=len(raw), scale_note=note)
+    text, image = _call_through_sdk(monkeypatch, "vision_analyze", envelope)
+    assert "where is the cat?" in text.text and note in text.text
+    assert base64.b64decode(image.data) == raw and image.mime_type == "image/jpeg"
+
+
+def test_prepared_inline_screenshot_wins_over_the_original_file(tmp_path, monkeypatch):
+    """The browser producer embeds a copy resized to the payload budget and keeps the full-size
+    original's path for sharing; MCP must deliver the prepared copy and must not need the file."""
+    pil_image = pytest.importorskip("PIL.Image")
+    from tools import vision_tools
+    from tools.browser_use_cli import _native_screenshot_result
+
+    shot = tmp_path / "shot.png"
+    pil_image.new("RGB", (vision_tools._EMBED_MAX_DIMENSION * 2,) * 2, "navy").save(shot)
+    monkeypatch.setattr(vision_tools, "_should_use_native_vision_fast_path", lambda: True)
+    envelope = _native_screenshot_result({"success": True}, str(shot))
+    prepared = next(p["image_url"]["url"] for p in envelope["content"] if p["type"] == "image_url")
+    shot.unlink()
+    _text, image = _call_through_sdk(monkeypatch, "browser_vision", envelope)
+    assert base64.b64decode(image.data) == base64.b64decode(prepared.partition(",")[2])
+    assert image.mime_type == prepared[len("data:"):].split(";")[0]
 
 
 def test_only_the_canonical_envelope_takes_the_image_branch():
@@ -171,17 +207,27 @@ def test_only_the_canonical_envelope_takes_the_image_branch():
         assert json.loads(_project_tool_result("t", stray)) == stray
 
 
-def test_images_degrade_to_text_without_an_inline_source_or_sdk_helper(monkeypatch):
-    """A remote image URL is named in the text rather than fetched, and an SDK without an
-    ``Image`` helper still returns the text instead of failing the call."""
-    def envelope(url):
-        return {"_multimodal": True, "text_summary": "seen",
-                "content": [{"type": "image_url", "image_url": {"url": url}}]}
+@pytest.mark.parametrize("url", [
+    "https://example.com/a.png",
+    "data:image/png;base64",
+    "data:image/png;base64,",
+    "data:image/png;base64,!!!!",
+    "data:text/plain;base64,aGVsbG8=",
+])
+def test_unusable_images_degrade_to_text(url, tmp_path):
+    """A remote URL is named rather than fetched; a malformed or non-image data URL, and a
+    screenshot file that is gone, yield text instead of an empty or mistyped image block."""
+    result = _project_tool_result("t", {
+        "_multimodal": True, "text_summary": "seen", "meta": {"screenshot_path": str(tmp_path / "gone.png")},
+        "content": [{"type": "image_url", "image_url": {"url": url}}]})
+    assert isinstance(result, str) and result.startswith("seen")
+    assert url.startswith("data:") or url in result
 
-    remote = _project_tool_result("t", envelope("https://example.com/a.png"))
-    assert isinstance(remote, str) and "https://example.com/a.png" in remote
 
-    inline = envelope("data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n").decode())
+def test_sdk_without_an_image_helper_degrades_to_text(monkeypatch):
+    """An SDK without an ``Image`` helper still returns the text instead of failing the call."""
+    inline = {"_multimodal": True, "text_summary": "seen", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"\x89PNG").decode()}}]}
     assert isinstance(_project_tool_result("t", inline), list)
     for sdk_module in ("mcp.server.mcpserver.utilities.types", "mcp.server.fastmcp.utilities.types"):
         monkeypatch.setitem(sys.modules, sdk_module, None)  # None in sys.modules -> ImportError
