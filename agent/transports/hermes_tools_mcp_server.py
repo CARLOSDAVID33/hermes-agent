@@ -16,12 +16,15 @@ if __name__ == "__main__":
     except ModuleNotFoundError:
         pass  # a partial ``hermes update`` can leave the bootstrap unregistered
 
+import base64
 import inspect
 import json
 import logging
 import os
 import sys
 from typing import Any, Optional
+
+from agent.tool_dispatch_helpers import _is_multimodal_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -65,36 +68,47 @@ def _project_tool_result(tool_name: str, result: Any) -> Any:
     returning the image, and every MCP client lost the vision half of the tool surface.
 
     Text stays text; a multimodal envelope becomes a text block plus a real MCP image block read
-    from the screenshot path the envelope already carries. Anything else is JSON-serialized so an
-    unexpected shape degrades into text rather than a protocol error.
+    from the screenshot path the envelope carries or, failing that, decoded from the base64 data
+    URL in its ``content`` (``vision_analyze`` carries no path). Anything else is JSON-serialized
+    so an unexpected shape degrades into text rather than a protocol error.
     """
     if isinstance(result, str):
         return result
-    if isinstance(result, dict) and result.get("_multimodal"):
+    if _is_multimodal_tool_result(result):
         meta = result.get("meta") or {}
         text = result.get("text_summary") or meta.get("text_summary") or ""
         if not text:
             text = json.dumps({k: v for k, v in result.items() if k != "content"},
                               ensure_ascii=False, default=str)
         path = meta.get("screenshot_path") or meta.get("image_path") or ""
-        if not path:
-            logger.warning("%s returned a multimodal result with no image path; sending text only",
+        # Only ``content`` holds the full image URL; ``meta.image_url`` is cut to 200 chars.
+        images = [p.get("image_url") for p in result["content"]
+                  if isinstance(p, dict) and p.get("type") == "image_url"]
+        url = next((i["url"] for i in images if isinstance(i, dict) and isinstance(i.get("url"), str)), "")
+        header, _, payload = url.partition(",")
+        if path:
+            text = f"{text}\n\n[screenshot: {path}]"
+        elif not (header.startswith("data:") and header.endswith(";base64")):
+            # A remote URL is named, not fetched: the bridge makes no network calls of its own.
+            logger.warning("%s returned a multimodal result with no inline image; sending text only",
                            tool_name)
-            return text
-        text = f"{text}\n\n[screenshot: {path}]"
+            return f"{text}\n\n[image: {url}]" if url else text
         try:
             from mcp.server.mcpserver.utilities.types import Image  # mcp >= 2.0
-        except ImportError:  # pragma: no cover - older SDK: keep the path, drop the inline image
+        except ImportError:
             try:
                 from mcp.server.fastmcp.utilities.types import Image  # mcp 1.x
             except ImportError:
-                logger.warning("%s: SDK has no Image helper; the screenshot path is in the text",
-                               tool_name)
+                logger.warning("%s: SDK has no Image helper; sending text only", tool_name)
                 return text
         try:
-            return [text, Image(path=path)]
+            if path:
+                return [text, Image(path=path)]
+            # data:image/jpeg;base64,... -> format "jpeg" -> image/jpeg (no subtype -> the SDK's png)
+            fmt = header[len("data:"):].split(";")[0].rpartition("/")[2]
+            return [text, Image(data=base64.b64decode(payload), format=fmt or None)]
         except Exception:
-            logger.exception("%s: attaching screenshot %s failed", tool_name, path)
+            logger.exception("%s: attaching image %s failed", tool_name, path or header)
             return text
     return json.dumps(result, ensure_ascii=False, default=str)
 
