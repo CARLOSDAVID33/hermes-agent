@@ -17,7 +17,6 @@ if __name__ == "__main__":
         pass  # a partial ``hermes update`` can leave the bootstrap unregistered
 
 import base64
-import binascii
 import inspect
 import json
 import logging
@@ -68,7 +67,7 @@ def _decode_image_data_url(url: str) -> tuple[bytes, str] | None:
     fmt = _MCP_IMAGE_FORMATS.get(header[len("data:"):].split(";")[0].lower())
     try:
         data = base64.b64decode(payload, validate=True)
-    except binascii.Error:
+    except ValueError:  # binascii.Error, and non-ASCII input
         return None
     return (data, fmt) if fmt and data else None
 

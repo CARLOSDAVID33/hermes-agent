@@ -212,6 +212,7 @@ def test_only_the_canonical_envelope_takes_the_image_branch():
     "data:image/png;base64",
     "data:image/png;base64,",
     "data:image/png;base64,!!!!",
+    "data:image/png;base64,é",
     "data:text/plain;base64,aGVsbG8=",
 ])
 def test_unusable_images_degrade_to_text(url, tmp_path):
